@@ -7,7 +7,7 @@ const client = createClient({
     password: process.env.radis_password,
     socket: {
         host: process.env.radis_host,
-        port: 10269
+        port: 13333
         
     },
      tls: {}
@@ -22,3 +22,5 @@ const result = await client.get('foo');
 console.log(result)  // >>> bar
 
 export const redis = client;
+
+
