@@ -1,6 +1,5 @@
 /**
  * Approximate token count: 1 token ≈ 4 chars
- * Simple, fast, Node.js friendly
  */
 function approximateTokens(text) {
   return Math.ceil(text.length / 4);
@@ -14,13 +13,31 @@ function splitSentences(text) {
 }
 
 /**
- * Optimized sentence + token-aware chunking
- * Packs sentences close to maxTokens while keeping overlap
- * 
- * @param {string} text - full text
- * @param {number} maxTokens - max tokens per chunk (approximate)
- * @param {number} overlapTokens - tokens to overlap between chunks
- * @returns {string[]} - array of text chunks
+ * Further split long sentences into sub-sentences if they exceed maxTokens
+ */
+function splitLongSentence(sentence, maxTokens) {
+  const tokens = approximateTokens(sentence);
+  if (tokens <= maxTokens) return [sentence];
+
+  // Simple split by comma or semicolon
+  const parts = sentence.split(/[,;]+/).map(s => s.trim()).filter(Boolean);
+  // If still too long, fallback to character split
+  const chunks = [];
+  let buffer = "";
+  for (const part of parts) {
+    if (approximateTokens(buffer + " " + part) > maxTokens) {
+      if (buffer) chunks.push(buffer);
+      buffer = part;
+    } else {
+      buffer += buffer ? " " + part : part;
+    }
+  }
+  if (buffer) chunks.push(buffer);
+  return chunks;
+}
+
+/**
+ * Optimized sentence + token-aware chunking with overlap
  */
 export function chunkText(text, maxTokens = 200, overlapTokens = 30) {
   const sentences = splitSentences(text);
@@ -30,40 +47,38 @@ export function chunkText(text, maxTokens = 200, overlapTokens = 30) {
   let currentTokens = 0;
 
   for (const sentence of sentences) {
-    const sentenceTokens = approximateTokens(sentence);
+    const subSentences = splitLongSentence(sentence, maxTokens);
 
-    // If adding this sentence exceeds maxTokens, finalize current chunk
-    if (currentTokens + sentenceTokens > maxTokens) {
-      // Save chunk
-      chunks.push(currentChunk.join(' '));
+    for (const sub of subSentences) {
+      const sentenceTokens = approximateTokens(sub);
 
-      // Keep overlap sentences for next chunk
-      let overlapSentenceTokens = 0;
-      const overlapChunk = [];
+      // finalize chunk if exceeding maxTokens
+      if (currentTokens + sentenceTokens > maxTokens) {
+        // save chunk
+        chunks.push(currentChunk.join(' '));
 
-      // Walk backwards to pack overlapTokens
-      for (let i = currentChunk.length - 1; i >= 0; i--) {
-        const t = approximateTokens(currentChunk[i]);
-        if (overlapSentenceTokens + t <= overlapTokens) {
-          overlapChunk.unshift(currentChunk[i]);
-          overlapSentenceTokens += t;
-        } else {
-          break;
+        // keep overlap for next chunk
+        let overlapSentenceTokens = 0;
+        const overlapChunk = [];
+        for (let i = currentChunk.length - 1; i >= 0; i--) {
+          const t = approximateTokens(currentChunk[i]);
+          if (overlapSentenceTokens + t <= overlapTokens) {
+            overlapChunk.unshift(currentChunk[i]);
+            overlapSentenceTokens += t;
+          } else break;
         }
+
+        currentChunk = [...overlapChunk];
+        currentTokens = overlapSentenceTokens;
       }
 
-      currentChunk = [...overlapChunk];
-      currentTokens = overlapSentenceTokens;
+      currentChunk.push(sub);
+      currentTokens += sentenceTokens;
     }
-
-    currentChunk.push(sentence);
-    currentTokens += sentenceTokens;
   }
 
-  // Push last chunk
-  if (currentChunk.length > 0) {
-    chunks.push(currentChunk.join(' '));
-  }
+  // push last chunk
+  if (currentChunk.length > 0) chunks.push(currentChunk.join(' '));
 
   return chunks;
 }
