@@ -32,7 +32,7 @@ function buildQdrantFilter(filters = {}) {
   return must.length > 0 ? { must } : undefined;
 }
 
-// --- Safe batched ingest for plain text ---
+// --- Text ingestion ---
 export const ingestText = async (req, res) => {
   try {
     const { text, filename = "user_text.txt", ...extraPayload } = req.body;
@@ -60,7 +60,7 @@ export const ingestText = async (req, res) => {
   }
 };
 
-// --- Safe batched ingest for PDF ---
+// --- PDF ingestion ---
 export const ingestPDF = async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "PDF file required" });
@@ -98,102 +98,50 @@ export const ingestPDF = async (req, res) => {
   }
 };
 
-// --- Original hybrid query ---
+// --- Query with greeting, hybrid detection, and fallback ---
 export const query = async (req, res) => {
-  try {
-    const { question, filters = {}, limit = 5, minScore = 0.0, hybrid = false, rewrite = false } = req.body;
-    if (!question) return res.status(400).json({ error: "Question required" });
-
-    const qVec = await embedText(question);
-    const semanticResults = await qdrant.search("docs", {
-      vector: qVec,
-      limit: 30,
-      withPayload: true,
-      filter: buildQdrantFilter(filters),
-    });
-
-    let boostedResults = semanticResults;
-    if (hybrid) {
-      const lowerQ = question.toLowerCase();
-      boostedResults = semanticResults.map((r) => {
-        const text = r.payload.chunk.toLowerCase();
-        const keywordBoost = lowerQ.split(/\s+/).reduce((score, word) => text.includes(word) ? score + 0.02 : score, 0);
-        return { ...r, score: r.score + keywordBoost };
-      });
-    }
-
-    const filtered = boostedResults.filter(r => r.score >= minScore).slice(0, 15);
-    if (filtered.length === 0) return res.json({ answer: "No relevant context found." });
-
-    const rerankPrompt = `
-You are the CSEC-ASTU Info Assistant. Answer the user’s question using the provided text snippets.
-
-Steps:
-1. Rerank the snippets by relevance to the user’s question.
-2. Return the top ${limit} snippets as a JSON array with keys "chunk" and "score".
-3. If no snippets are relevant, respond conversationally and helpfully. For example:
-   "Hi! I don’t have exact info on that right now, but I can help you learn about CSEC-ASTU or its divisions."
-4. If the user says "Hi," makes a joke, or sends casual conversation:
-   - Reply politely with light humor or a friendly tone.
-   - Example: "Hello there! 😄 I’m always happy to talk about CSEC-ASTU. How can I help you today?"
-5. Maintain professional warmth: clear, approachable, and proud of representing the club.
-Question: ${question}
-
-Snippets:
-${filtered.map((f, i) => `[${i + 1}] ${f.payload.chunk}`).join("\n\n")}
-    `;
-
-    let rerankedChunks;
-    try {
-      rerankedChunks = JSON.parse(await sendToGemini(rerankPrompt));
-    } catch {
-      rerankedChunks = filtered.slice(0, limit).map(f => ({ chunk: f.payload.chunk, score: f.score }));
-    }
-
-    const answerPrompt = `
-You are the CSEC-ASTU Info Assistant. Use only the following context to answer the user's question. 
-
-Guidelines:
-- Answer as accurately as possible using the provided context.
-- If unsure, respond helpfully and conversationally. For example:
-  "Hi! I don’t have exact info on that right now, but I can help you learn about CSEC-ASTU or its divisions."
-- If asked who developed you, respond: "HUSSEIN BESHIR."
-- Maintain professional warmth: clear, approachable, and proud of representing the club.
-- If the user says "Hi," makes a joke, or sends casual conversation, respond politely with light humor or a friendly tone.
-  Example: "Hello there! 😄 I’m always happy to talk about CSEC-ASTU. How can I help you today?"
-
-
-Context:
-${rerankedChunks.map(c => c.chunk).join("\n\n")}
-
-Question:
-${question}
-
-Answer:
-    `;
-
-    let answer = await sendToGemini(answerPrompt);
-    if (rewrite) answer = await sendToGemini(`Rewrite the following answer for clarity, keeping it concise and friendly:\n\n${answer}`);
-
-    res.json({ answer, rerankedChunks, usedFilters: filters, hybrid, rewriteApplied: rewrite });
-  } catch (e) {
-    console.error("Query error:", e);
-    res.status(500).json({ error: e.message });
-  }
-};
-
-// --- Ultra-fast query with Redis caching ---
-export const fastQuery = async (req, res) => {
   try {
     const { question, filters = {}, limit = 5, minScore = 0.0 } = req.body;
     if (!question) return res.status(400).json({ error: "Question required" });
 
-    const cacheKey = `answer:${question.trim().toLowerCase()}:${JSON.stringify(filters)}`;
-    const cachedAnswer = await redis.get(cacheKey);
-    if (cachedAnswer) return res.json({ answer: cachedAnswer, cached: true });
+    const lowerQ = question.trim().toLowerCase();
 
-    // --- Cache embeddings ---
-    const embedKey = `embed:${question.trim().toLowerCase()}`;
+    // --- Greeting detection (even inside longer sentences) ---
+    const greetKeywords = [
+      "hi", "hello", "hey", "yo", "what’s up", "sup",
+      "good morning", "good afternoon", "good evening",
+      "how are you", "how’s it going", "greetings"
+    ];
+    const hasGreeting = greetKeywords.some((kw) => lowerQ.includes(kw));
+
+    // --- Handle pure or follow-up greetings ---
+    if (hasGreeting && lowerQ.split(" ").length <= 6) {
+      const greetingPrompt = `
+You are the official CSEC-ASTU Info Assistant.
+The user greeted or casually addressed you with: "${question}".
+Respond warmly and confidently, showing friendly energy.
+Sound institutional — like a proud club representative — but approachable.
+End by inviting them naturally to ask about CSEC-ASTU, its divisions, or events.
+
+Example style:
+"Hey there yourself! 👋 I’m the CSEC-ASTU Info Assistant — proud to represent the club. What would you like to explore about us today?"
+
+Now respond:
+      `;
+      const greetingAnswer = await sendToGemini(greetingPrompt);
+      return res.json({
+        answer: greetingAnswer,
+        greeting: true,
+      });
+    }
+
+    // --- Redis cache check ---
+    const cacheKey = `answer:${lowerQ}:${JSON.stringify(filters)}`;
+    const cached = await redis.get(cacheKey);
+    if (cached) return res.json({ answer: cached, cached: true });
+
+    // --- Embed (cached if possible) ---
+    const embedKey = `embed:${lowerQ}`;
     let qVec = await redis.get(embedKey);
     if (qVec) qVec = JSON.parse(qVec);
     else {
@@ -202,28 +150,48 @@ export const fastQuery = async (req, res) => {
     }
 
     // --- Qdrant search ---
-    const searchResults = await qdrant.search("docs", {
+    const results = await qdrant.search("docs", {
       vector: qVec,
       limit: limit * 3,
       withPayload: true,
       filter: buildQdrantFilter(filters),
     });
 
-    const filteredChunks = searchResults
-      .filter(r => r.score >= minScore)
-      .map(r => r.payload.chunk)
+    const filtered = results
+      .filter((r) => r.score >= minScore)
+      .map((r) => r.payload.chunk)
       .slice(0, limit);
 
-    if (!filteredChunks.length) return res.json({ answer: "No relevant context found." });
+    // --- No context fallback ---
+    if (!filtered.length) {
+      const fallbackPrompt = `
+You are the official CSEC-ASTU Info Assistant.
+The user asked: "${question}".
+You found no matching context in your database.
+Still respond naturally, with warmth, confidence, and institutional pride.
+Never say “no context” or “not found.”
+Encourage curiosity and keep the tone friendly.
 
-    // --- Single LLM call ---
+Examples:
+- "Hmm, that’s an interesting one! I don’t have exact info right now, but I can share something about CSEC-ASTU’s divisions or our events."
+- "Not sure about that yet — but let’s talk about how CSEC-ASTU helps students grow!"
+
+Now respond:
+      `;
+      const fallbackAnswer = await sendToGemini(fallbackPrompt);
+      return res.json({ answer: fallbackAnswer, noContext: true });
+    }
+
+    // --- Main Gemini Answer ---
     const prompt = `
-You are a helpful AI assistant. Use only the following context to answer the user's question.
-If unsure, say "Sorry, I don't know."
-If asked who developed you, say HUSSEIN BESHIR.
+You are the official CSEC-ASTU Info Assistant.
+Use ONLY the context provided below to answer accurately and clearly.
+Keep a friendly and proud tone — like a human club representative.
+If unsure, guide the user politely instead of guessing.
+If asked who developed you, say: "HUSSEIN BESHIR."
 
 Context:
-${filteredChunks.join("\n\n")}
+${filtered.join("\n\n")}
 
 Question:
 ${question}
@@ -232,13 +200,11 @@ Answer:
     `;
 
     const answer = await sendToGemini(prompt);
-
-    // --- Cache the answer ---
     await redis.set(cacheKey, answer, "EX", 3600);
 
-    res.json({ answer, cached: false, usedFilters: filters });
+    res.json({ answer, cached: false });
   } catch (e) {
-    console.error("Fast query error:", e);
+    console.error("Query error:", e);
     res.status(500).json({ error: e.message });
   }
 };
